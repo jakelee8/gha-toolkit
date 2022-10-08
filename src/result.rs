@@ -3,47 +3,35 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
-    #[error("Incomplete download. Invalid chunk checksum.")]
+    #[error("Invalid chunk checksum")]
     CacheChunkChecksum,
 
-    #[error("Cache service responded with {0} during upload chunk.")]
-    CacheChunkUpload(http::StatusCode),
-
-    #[error(
-        "Incomplete download. Expected chunk size: {expected_size}, actual chunk size: {actual_size}"
-    )]
-    CacheChunkDownload {
+    #[error("While {message}: expected chunk size {expected_size} got {actual_size}")]
+    CacheChunkSize {
         expected_size: usize,
         actual_size: usize,
-    },
-
-    #[error("Cache service responded with {0} during commit cache.")]
-    CacheCommit(http::StatusCode),
-
-    #[error(
-        "Incomplete download. Expected file size: {expected_size}, actual file size: {actual_size}"
-    )]
-    CacheDownload {
-        expected_size: usize,
-        actual_size: usize,
+        message: &'static str,
     },
 
     #[error("Cache not found.")]
     CacheNotFound,
 
-    #[error("Cache service responded with {0}")]
-    CacheServiceStatus(http::StatusCode),
+    #[error("Cache service responded with {status}: {message}")]
+    CacheServiceStatus {
+        status: http::StatusCode,
+        message: String,
+    },
 
-    #[error("Cache size of {0} bytes is too large.")]
-    CacheSize(usize),
+    #[error("Cache size of {0} bytes is too large")]
+    CacheSizeTooLarge(usize),
 
     #[error(transparent)]
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
 
-    #[error("Key Validation Error: {0} cannot contain commas.")]
+    #[error("Key Validation Error: {0} cannot contain commas")]
     InvalidKeyComma(String),
 
-    #[error("Key Validation Error: {0} cannot be larger than 512 characters.")]
+    #[error("Key Validation Error: {0} cannot be larger than 512 characters")]
     InvalidKeyLength(String),
 
     #[error(transparent)]
@@ -63,4 +51,11 @@ pub enum Error {
 
     #[error(transparent)]
     UrlParse(#[from] url::ParseError),
+
+    #[error("Error reading env var \"{name}\": {source} ")]
+    VarError {
+        #[source]
+        source: std::env::VarError,
+        name: &'static str,
+    },
 }

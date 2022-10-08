@@ -1,6 +1,6 @@
 [package]
 name = "gha-toolkit"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "GitHub Actions toolkit for Rust"
 license = "MIT"
@@ -28,3 +28,6 @@ shell-escape = "0.1.5"
 thiserror = "1.0.37"
 tracing = "0.1.36"
 url = "2.2.2"
+
+[dev-dependencies]
+tokio = { version = "1.21.2", features = ["macros"] }

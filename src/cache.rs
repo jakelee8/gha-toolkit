@@ -15,7 +15,7 @@ use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use reqwest_retry_after::RetryAfterMiddleware;
 use reqwest_tracing::TracingMiddleware;
 use sha2::{Digest, Sha256};
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use crate::{Error, Result};
 
@@ -104,22 +104,22 @@ impl CacheClientBuilder {
 
         let download_chunk_timeout = std::env::var("SEGMENT_DOWNLOAD_TIMEOUT_MINS")
             .ok()
-            .and_then(|s| u64::from_str_radix(&s, 10).ok())
-            .map(|v| Duration::from_secs(v * 60))
+            .and_then(|s| s.parse().ok())
+            .map(|v: u64| Duration::from_secs(v * 60))
             .unwrap_or(Duration::from_secs(60));
 
-        let restore_keys: Vec<String> = restore_keys.into_iter().map(|s| s.to_string()).collect();
+        let restore_keys: Vec<String> = restore_keys.iter().map(|s| s.to_string()).collect();
         let restore_keys = restore_keys.join(",");
 
         Ok(Self {
-            user_agent: env!("CARGO_CRATE_NAME").to_string(),
+            user_agent: format!("{}/{}", env!("CARGO_CRATE_NAME"), env!("CARGO_PKG_VERSION")),
             base_url: base_url.into(),
             token: token.into(),
             key: key.to_string(),
             restore_keys,
             max_retries: 2,
-            min_retry_interval: Duration::from_millis(5556),
-            max_retry_interval: Duration::from_secs(5),
+            min_retry_interval: Duration::from_millis(50),
+            max_retry_interval: Duration::from_secs(10),
             backoff_factor_base: 3,
             download_chunk_size: 4 << 20, // 4 MiB
             download_chunk_timeout,
@@ -196,56 +196,14 @@ impl CacheClientBuilder {
     }
 
     pub fn build(self) -> Result<CacheClient> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::ACCEPT,
-            HeaderValue::from_static("application/json;api-version=6.0-preview.1"),
-        );
-
-        let auth_value = format!("Bearer {}", self.token);
-        let mut auth_value = header::HeaderValue::from_str(&auth_value)?;
-        auth_value.set_sensitive(true);
-        headers.insert(http::header::AUTHORIZATION, auth_value);
-
-        let retry_policy = ExponentialBackoff::builder()
-            .retry_bounds(self.min_retry_interval, self.max_retry_interval)
-            .backoff_exponent(self.backoff_factor_base)
-            .build_with_max_retries(self.max_retries);
-
-        let client = reqwest::ClientBuilder::new()
-            .user_agent(self.user_agent)
-            .default_headers(headers)
-            .build()?;
-        let client = reqwest_middleware::ClientBuilder::new(client)
-            .with(TracingMiddleware::default())
-            .with(RetryAfterMiddleware::new())
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build();
-
-        let base_url = Url::parse(&format!(
-            "{}{}",
-            self.base_url.trim_end_matches("/"),
-            BASE_URL_PATH
-        ))?;
-
-        Ok(CacheClient {
-            client,
-            base_url,
-            key: self.key,
-            restore_keys: self.restore_keys,
-            download_chunk_size: self.download_chunk_size,
-            download_chunk_timeout: self.download_chunk_timeout,
-            download_concurrency: self.download_concurrency,
-            upload_concurrency: self.upload_concurrency,
-            upload_chunk_timeout: self.upload_chunk_timeout,
-            upload_chunk_size: self.upload_chunk_size,
-        })
+        self.try_into()
     }
 }
 
 pub struct CacheClient {
     client: ClientWithMiddleware,
     base_url: Url,
+    api_headers: HeaderMap,
 
     key: String,
     restore_keys: String,
@@ -259,7 +217,75 @@ pub struct CacheClient {
     upload_concurrency: u32,
 }
 
+impl TryInto<CacheClient> for CacheClientBuilder {
+    type Error = Error;
+
+    fn try_into(self) -> Result<CacheClient, Self::Error> {
+        let mut api_headers = HeaderMap::new();
+        api_headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/json;api-version=6.0-preview.1"),
+        );
+
+        let auth_value = Bytes::from(format!("Bearer {}", self.token));
+        let mut auth_value = header::HeaderValue::from_maybe_shared(auth_value)?;
+        auth_value.set_sensitive(true);
+        api_headers.insert(http::header::AUTHORIZATION, auth_value);
+
+        let retry_policy = ExponentialBackoff::builder()
+            .retry_bounds(self.min_retry_interval, self.max_retry_interval)
+            .backoff_exponent(self.backoff_factor_base)
+            .build_with_max_retries(self.max_retries);
+
+        let client = reqwest::ClientBuilder::new()
+            .user_agent(self.user_agent)
+            .build()?;
+        let client = reqwest_middleware::ClientBuilder::new(client)
+            .with(TracingMiddleware::default())
+            .with(RetryAfterMiddleware::new())
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .build();
+
+        let base_url = Url::parse(&format!(
+            "{}{}",
+            self.base_url.trim_end_matches('/'),
+            BASE_URL_PATH
+        ))?;
+
+        Ok(CacheClient {
+            client,
+            base_url,
+            api_headers,
+            key: self.key,
+            restore_keys: self.restore_keys,
+            download_chunk_size: self.download_chunk_size,
+            download_chunk_timeout: self.download_chunk_timeout,
+            download_concurrency: self.download_concurrency,
+            upload_concurrency: self.upload_concurrency,
+            upload_chunk_timeout: self.upload_chunk_timeout,
+            upload_chunk_size: self.upload_chunk_size,
+        })
+    }
+}
+
 impl CacheClient {
+    pub fn from_env() -> Result<Self> {
+        let url = env::var("ACTIONS_CACHE_URL").map_err(|source| Error::VarError {
+            source,
+            name: "ACTIONS_CACHE_URL",
+        })?;
+        let token = env::var("ACTIONS_RUNTIME_TOKEN").map_err(|source| Error::VarError {
+            source,
+            name: "ACTIONS_RUNTIME_TOKEN",
+        })?;
+        let key = env::var("ACTIONS_CACHE_KEY").map_err(|source| Error::VarError {
+            source,
+            name: "ACTIONS_CACHE_KEY",
+        })?;
+        let restore_keys = env::var("ACTIONS_CACHE_RESTORE_KEYS").unwrap_or_else(|_| key.clone());
+        CacheClientBuilder::new(&url, &token, &key, &[&restore_keys])?.build()
+    }
+
     pub fn builder<B: Into<String>, T: Into<String>>(
         base_url: B,
         token: T,
@@ -282,7 +308,7 @@ impl CacheClient {
         &self.restore_keys
     }
 
-    #[instrument(skip_all, fields(restore_keys, version))]
+    #[instrument(skip(self))]
     pub async fn entry(&self, version: &str) -> Result<Option<ArtifactCacheEntry>> {
         let query = serde_urlencoded::to_string(&CacheQuery {
             keys: &self.restore_keys,
@@ -291,12 +317,19 @@ impl CacheClient {
         let mut url = self.base_url.join("cache")?;
         url.set_query(Some(&query));
 
-        let response = self.client.get(url).send().await?;
-        if response.status() == http::StatusCode::NO_CONTENT {
+        let response = self
+            .client
+            .get(url)
+            .headers(self.api_headers.clone())
+            .send()
+            .await?;
+        let status = response.status();
+        if status == http::StatusCode::NO_CONTENT {
             return Ok(None);
         };
-        if !response.status().is_success() {
-            return Err(Error::CacheServiceStatus(response.status()));
+        if !status.is_success() {
+            let message = response.text().await.unwrap_or_else(|err| err.to_string());
+            return Err(Error::CacheServiceStatus { status, message });
         }
 
         let cache_result: ArtifactCacheEntry = response.json().await?;
@@ -314,13 +347,11 @@ impl CacheClient {
         Ok(Some(cache_result))
     }
 
-    #[instrument(skip_all, fields(url))]
+    #[instrument(skip(self))]
     pub async fn get(&self, url: &str) -> Result<Vec<u8>> {
         let uri = Url::parse(url)?;
 
-        let (data, cache_size) = self
-            .download_first_chunk(uri.clone(), 0, self.download_chunk_size)
-            .await?;
+        let (data, cache_size) = self.download_first_chunk(uri.clone()).await?;
 
         if cache_size.is_none() {
             return Ok(data.to_vec());
@@ -335,16 +366,11 @@ impl CacheClient {
             if actual_size == cache_size {
                 return Ok(data.to_vec());
             }
-            if actual_size > cache_size {
-                return Err(Error::CacheDownload {
-                    expected_size: cache_size as usize,
-                    actual_size: actual_size as usize,
-                });
-            }
             if actual_size != self.download_chunk_size {
-                return Err(Error::CacheChunkDownload {
+                return Err(Error::CacheChunkSize {
                     expected_size: self.download_chunk_size as usize,
                     actual_size: actual_size as usize,
+                    message: "verifying the first chunk size using the content-range header",
                 });
             }
 
@@ -364,7 +390,7 @@ impl CacheClient {
                 let mut chunks = future::try_join_all(chunks.into_iter()).await?;
                 chunks.insert(0, data);
 
-                return Ok(chunks.concat().into());
+                return Ok(chunks.concat());
             }
 
             // Download chunks with max concurrency
@@ -388,7 +414,7 @@ impl CacheClient {
             let mut chunks = future::try_join_all(chunks).await?;
             chunks.insert(0, data);
 
-            return Ok(chunks.concat().into());
+            return Ok(chunks.concat());
         }
 
         debug!("Unable to validate download, no Content-Range header or unknown size");
@@ -398,9 +424,10 @@ impl CacheClient {
             return Ok(data.to_vec());
         }
         if actual_size != self.download_chunk_size {
-            return Err(Error::CacheChunkDownload {
+            return Err(Error::CacheChunkSize {
                 expected_size: self.download_chunk_size as usize,
                 actual_size: actual_size as usize,
+                message: "verifying the first chunk size without the content-range header",
             });
         }
 
@@ -421,26 +448,23 @@ impl CacheClient {
                 break;
             }
             if chunk_size != self.download_chunk_size {
-                return Err(Error::CacheChunkDownload {
+                return Err(Error::CacheChunkSize {
                     expected_size: self.download_chunk_size as usize,
                     actual_size: chunk_size as usize,
+                    message: "verifying a chunk size without the content-range header",
                 });
             }
 
             start += self.download_chunk_size;
         }
 
-        Ok(chunks.concat().into())
+        Ok(chunks.concat())
     }
 
-    #[instrument(skip_all, fields(uri, start, size))]
-    async fn download_first_chunk(
-        &self,
-        uri: Url,
-        start: u64,
-        size: u64,
-    ) -> Result<(Bytes, Option<ContentRange>)> {
-        self.do_download_chunk(uri, start, size, true).await
+    #[instrument(skip(self, uri))]
+    async fn download_first_chunk(&self, uri: Url) -> Result<(Bytes, Option<ContentRange>)> {
+        self.do_download_chunk(uri, 0, self.download_chunk_size, true)
+            .await
     }
 
     #[instrument(skip_all, fields(uri, start, size))]
@@ -449,7 +473,7 @@ impl CacheClient {
         Ok(bytes)
     }
 
-    #[instrument(skip_all, fields(uri, start, size))]
+    #[instrument(skip(self, uri))]
     async fn do_download_chunk(
         &self,
         uri: Url,
@@ -471,11 +495,14 @@ impl CacheClient {
             .send()
             .await?;
 
-        let partial_content = expect_partial && response.status() == StatusCode::PARTIAL_CONTENT;
-        if !response.status().is_success() {
-            return Err(Error::CacheServiceStatus(response.status()));
+        let status = response.status();
+        let partial_content = expect_partial && status == StatusCode::PARTIAL_CONTENT;
+        if !status.is_success() {
+            let message = response.text().await.unwrap_or_else(|err| err.to_string());
+            return Err(Error::CacheServiceStatus { status, message });
         }
 
+        let content_length = response.content_length();
         let headers = response.headers();
 
         let content_range = if partial_content {
@@ -483,7 +510,10 @@ impl CacheClient {
                 .get(header::CONTENT_RANGE)
                 .and_then(|v| ContentRange::parse_header(&v).ok())
         } else {
-            None
+            Some(ContentRange(ContentRangeSpec::Bytes {
+                range: None,
+                instance_length: content_length,
+            }))
         };
 
         let md5sum = response
@@ -493,17 +523,23 @@ impl CacheClient {
             .and_then(|s| hex::decode(s).ok());
 
         let bytes = response.bytes().await?;
-        if bytes.len() != size as usize {
-            return Err(Error::CacheChunkDownload {
+        let actual_size = bytes.len() as u64;
+        if actual_size != content_length.unwrap_or(actual_size) || actual_size > size {
+            return Err(Error::CacheChunkSize {
                 expected_size: size as usize,
                 actual_size: bytes.len(),
+                message: if expect_partial {
+                    "downloading a chunk"
+                } else {
+                    "downloading the first chunk"
+                },
             });
         }
 
         if let Some(md5sum) = md5sum {
             use md5::Digest as _;
             let checksum = md5::Md5::digest(&bytes);
-            if &md5sum[..] != &checksum[..] {
+            if md5sum[..] != checksum[..] {
                 return Err(Error::CacheChunkChecksum);
             }
         }
@@ -511,29 +547,27 @@ impl CacheClient {
         Ok((bytes, content_range))
     }
 
-    #[instrument(skip_all, fields(key))]
+    #[instrument(skip(self, data))]
     pub async fn put<T: Read + Seek>(&self, version: &str, mut data: T) -> Result<()> {
         let cache_size = data.seek(SeekFrom::End(0))?;
         if cache_size > i64::MAX as u64 {
-            return Err(Error::CacheSize(cache_size as usize));
+            return Err(Error::CacheSizeTooLarge(cache_size as usize));
         }
 
         let version = &get_cache_version(version);
         let cache_id = self.reserve(version, cache_size).await?;
 
-        data.rewind()?;
-        self.upload(cache_id, cache_size, data).await?;
-
-        let commit_cache_response = self.commit(cache_id, cache_size).await;
-        if let Err(Error::CacheServiceStatus(status)) = commit_cache_response {
-            return Err(Error::CacheCommit(status));
+        if let Some(cache_id) = cache_id {
+            data.rewind()?;
+            self.upload(cache_id, cache_size, data).await?;
+            self.commit(cache_id, cache_size).await?;
         }
 
         Ok(())
     }
 
-    #[instrument(skip_all, fields(key, paths, cache_size))]
-    async fn reserve(&self, version: &str, cache_size: u64) -> Result<i64> {
+    #[instrument(skip(self))]
+    async fn reserve(&self, version: &str, cache_size: u64) -> Result<Option<i64>> {
         let url = self.base_url.join("caches")?;
 
         let reserve_cache_request = ReserveCacheRequest {
@@ -545,16 +579,32 @@ impl CacheClient {
         let response = self
             .client
             .post(url)
+            .headers(self.api_headers.clone())
             .json(&reserve_cache_request)
             .send()
             .await?;
 
-        let ReserveCacheResponse { cache_id } = response.json().await?;
+        let status = response.status();
+        match status {
+            http::StatusCode::NO_CONTENT | http::StatusCode::CONFLICT => {
+                warn!(
+                    "No cache ID for key {} version {version}: {status:?}",
+                    self.key
+                );
+                return Ok(None);
+            }
+            _ if !status.is_success() => {
+                let message = response.text().await.unwrap_or_else(|err| err.to_string());
+                return Err(Error::CacheServiceStatus { status, message });
+            }
+            _ => {}
+        }
 
-        Ok(cache_id)
+        let ReserveCacheResponse { cache_id } = response.json().await?;
+        Ok(Some(cache_id))
     }
 
-    #[instrument(skip_all, fields(cache_id, cache_size))]
+    #[instrument(skip(self, data))]
     async fn upload<T: Read + Seek>(
         &self,
         cache_id: i64,
@@ -621,7 +671,7 @@ impl CacheClient {
         Ok(())
     }
 
-    #[instrument(skip_all, fields(start, end))]
+    #[instrument(skip(self, uri, body))]
     async fn upload_chunk<T: Into<Body>>(
         &self,
         uri: Url,
@@ -631,9 +681,10 @@ impl CacheClient {
     ) -> Result<()> {
         let content_range = format!("bytes {start}-{}/*", start + size - 1);
 
-        let upload_chunk_response = self
+        let response = self
             .client
             .patch(uri)
+            .headers(self.api_headers.clone())
             .header(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
@@ -647,14 +698,16 @@ impl CacheClient {
             .send()
             .await?;
 
-        if upload_chunk_response.status().is_success() {
+        let status = response.status();
+        if status.is_success() {
             Ok(())
         } else {
-            Err(Error::CacheChunkUpload(upload_chunk_response.status()))
+            let message = response.text().await.unwrap_or_else(|err| err.to_string());
+            Err(Error::CacheServiceStatus { status, message })
         }
     }
 
-    #[instrument(skip_all, fields(id, size))]
+    #[instrument(skip(self))]
     async fn commit(&self, cache_id: i64, cache_size: u64) -> Result<()> {
         let url = self.base_url.join(&format!("caches/{cache_id}"))?;
         let commit_cache_request = CommitCacheRequest {
@@ -664,14 +717,17 @@ impl CacheClient {
         let response = self
             .client
             .post(url)
+            .headers(self.api_headers.clone())
             .json(&commit_cache_request)
             .send()
             .await?;
 
-        if response.status().is_success() {
+        let status = response.status();
+        if status.is_success() {
             Ok(())
         } else {
-            Err(Error::CacheServiceStatus(response.status()))
+            let message = response.text().await.unwrap_or_else(|err| err.to_string());
+            Err(Error::CacheServiceStatus { status, message })
         }
     }
 }
@@ -699,4 +755,42 @@ pub fn check_key(key: &str) -> Result<()> {
         return Err(Error::InvalidKeyComma(key.to_string()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use std::io;
+    use std::time::SystemTime;
+
+    use tokio::test;
+
+    use super::*;
+
+    #[test]
+    async fn from_env() {
+        let version = SystemTime::UNIX_EPOCH.elapsed().unwrap().as_millis();
+        env::set_var("ACTIONS_CACHE_KEY", format!("gha-toolkit-{version:#x}"));
+
+        match CacheClient::from_env() {
+            Ok(client) => {
+                const CACHE_ENTRY: &str = "cache-entry";
+                const CACHE_DATA: &str = "Hello World!";
+
+                client
+                    .put(CACHE_ENTRY, io::Cursor::new(CACHE_DATA.as_bytes()))
+                    .await
+                    .unwrap();
+
+                let entry = client.entry(CACHE_ENTRY).await.unwrap().unwrap();
+
+                let url = entry.archive_location.unwrap();
+                let cache_data = client.get(&url).await.unwrap();
+                let cache_data = String::from_utf8_lossy(&cache_data);
+                assert_eq!(&cache_data, CACHE_DATA)
+            }
+            Err(err) => {
+                panic!("{err}");
+            }
+        }
+    }
 }
